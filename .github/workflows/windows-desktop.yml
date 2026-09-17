@@ -9,21 +9,10 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-          $installer = "$env:TEMP\tailscale.exe"
-
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          Start-Process $installer -ArgumentList "/quiet" -Wait
-
       - name: Connect to Tailscale
-        shell: powershell
-        env:
-          TS_AUTHKEY: ${{ secrets.TALESCALE_AUTH_KEY }}
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$env:TS_AUTHKEY"
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TALESCALE_AUTH_KEY }}
 
       - name: Enable RDP
         shell: powershell
@@ -35,18 +24,20 @@ jobs:
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Show Tailscale IP
+      - name: Get Tailscale IP
         shell: powershell
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          tailscale ip -4
+
+      - name: Show Tailscale status
+        shell: powershell
+        run: |
+          tailscale status
 
       - name: Keep runner alive
         shell: powershell
         run: |
-          Write-Host "========================================="
-          Write-Host "Windows runner is running"
-          Write-Host "========================================="
-
+          Write-Host "Windows runner is ready."
           while ($true) {
             Start-Sleep -Seconds 60
           }
