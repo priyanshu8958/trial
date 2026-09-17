@@ -1,4 +1,4 @@
-name: Windows Desktop
+name: Windows Desktop RDP
 
 on:
   workflow_dispatch:
@@ -14,30 +14,22 @@ jobs:
         with:
           authkey: ${{ secrets.TALESCALE_AUTH_KEY }}
 
-      - name: Create RDP User
+      - name: Set runneradmin password
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $username = "RDPUser"
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-              Set-LocalUser -Name $username -Password $securePassword
-          }
-          else {
-              New-LocalUser `
-                -Name $username `
-                -Password $securePassword `
-                -PasswordNeverExpires `
-                -AccountNeverExpires `
-                -UserMayNotChangePassword
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
           }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $username `
-            -ErrorAction SilentlyContinue
+          net user runneradmin "$env:RDP_PASSWORD"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to set runneradmin password."
+          }
+
+          Write-Host "runneradmin password set successfully."
 
       - name: Enable RDP
         shell: powershell
@@ -47,25 +39,47 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Show Tailscale IP
+          Write-Host "RDP enabled."
+
+      - name: Verify runneradmin
         shell: powershell
         run: |
-          Write-Host "Tailscale IP:"
+          net user runneradmin
+
+          Write-Host ""
+          Write-Host "RDP username: runneradmin"
+
+      - name: Show Tailscale information
+        shell: powershell
+        run: |
+          Write-Host "=========================================="
+          Write-Host "TAILSCALE IP"
+          Write-Host "=========================================="
+
           tailscale ip -4
 
           Write-Host ""
-          Write-Host "Tailscale status:"
+          Write-Host "TAILSCALE STATUS"
+          Write-Host "=========================================="
+
           tailscale status
 
       - name: Keep runner alive
         shell: powershell
         run: |
-          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "=========================================="
           Write-Host "RDP SERVER READY"
-          Write-Host "Username: RDPUser"
-          Write-Host "======================================"
+          Write-Host "Username: runneradmin"
+          Write-Host "Use the Tailscale IPv4 address above."
+          Write-Host "=========================================="
 
           while ($true) {
             Start-Sleep -Seconds 60
