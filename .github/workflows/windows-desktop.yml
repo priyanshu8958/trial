@@ -1,25 +1,72 @@
+name: Windows Desktop
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TALESCALE_AUTH_KEY }}
+
       - name: Create RDP User
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $username = "RDPUser"
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
-          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-
-          if (-not $existing) {
-              $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $username -Password $securePassword
+          }
+          else {
               New-LocalUser `
                 -Name $username `
                 -Password $securePassword `
                 -PasswordNeverExpires `
                 -AccountNeverExpires `
                 -UserMayNotChangePassword
-
-              Add-LocalGroupMember `
-                -Group "Remote Desktop Users" `
-                -Member $username
           }
 
-          Write-Host "RDP user configured."
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Show Tailscale IP
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP:"
+          tailscale ip -4
+
+          Write-Host ""
+          Write-Host "Tailscale status:"
+          tailscale status
+
+      - name: Keep runner alive
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "RDP SERVER READY"
+          Write-Host "Username: RDPUser"
+          Write-Host "======================================"
+
+          while ($true) {
+            Start-Sleep -Seconds 60
+          }
