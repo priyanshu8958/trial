@@ -1,10 +1,10 @@
-name: Windows RDP
+name: Windows Desktop
 
 on:
   workflow_dispatch:
 
 jobs:
-  windows-rdp:
+  windows-desktop:
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -13,13 +13,15 @@ jobs:
         shell: powershell
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\tailscale.exe"
-          Start-Process "$env:TEMP\tailscale.exe" -ArgumentList "/quiet" -Wait
+          $installer = "$env:TEMP\tailscale.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process $installer -ArgumentList "/quiet" -Wait
 
       - name: Connect to Tailscale
         shell: powershell
         env:
-          TS_AUTHKEY: ${{ secrets.TA​​LESCALE_AUTH_KEY }}
+          TS_AUTHKEY: ${{ secrets.TALESCALE_AUTH_KEY }}
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$env:TS_AUTHKEY"
 
@@ -41,8 +43,10 @@ jobs:
       - name: Keep runner alive
         shell: powershell
         run: |
-          Write-Host "Windows runner is running."
-          Write-Host "Use the Tailscale IP above for RDP."
+          Write-Host "========================================="
+          Write-Host "Windows runner is running"
+          Write-Host "========================================="
+
           while ($true) {
             Start-Sleep -Seconds 60
           }
