@@ -1,43 +1,25 @@
-name: Windows Desktop
-
-on:
-  workflow_dispatch:
-
-jobs:
-  windows-desktop:
-    runs-on: windows-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TALESCALE_AUTH_KEY }}
-
-      - name: Enable RDP
+      - name: Create RDP User
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
+          $username = "RDPUser"
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
-      - name: Get Tailscale IP
-        shell: powershell
-        run: |
-          tailscale ip -4
+          if (-not $existing) {
+              $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
-      - name: Show Tailscale status
-        shell: powershell
-        run: |
-          tailscale status
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -PasswordNeverExpires `
+                -AccountNeverExpires `
+                -UserMayNotChangePassword
 
-      - name: Keep runner alive
-        shell: powershell
-        run: |
-          Write-Host "Windows runner is ready."
-          while ($true) {
-            Start-Sleep -Seconds 60
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $username
           }
+
+          Write-Host "RDP user configured."
