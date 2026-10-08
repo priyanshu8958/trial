@@ -1,0 +1,447 @@
+name: Kali Linux (RDP + browser desktop)
+
+# Runs the maintained LinuxServer.io Kali desktop image and publishes it TWO ways,
+# so you can use whichever suits the machine you're sitting at:
+#
+#   native RDP  ->  xrdp inside the container, tunnelled out with bore   (fast, needs a client)
+#   browser     ->  the image's own Selkies web desktop via Cloudflare   (zero setup)
+#
+# Both addresses land in the run's SUMMARY tab. Neither needs an account or a secret.
+on:
+  workflow_dispatch:
+    inputs:
+      rdp:
+        description: "Set up native RDP (xrdp + bore). Adds ~2-3 min to startup."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kali-gui
+  cancel-in-progress: true
+
+jobs:
+  kali-gui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Start Kali desktop container
+        run: |
+          set -uo pipefail
+          WEBPASS=$(openssl rand -hex 5)
+          RDPPASS=$(openssl rand -hex 5)
+          {
+            echo "WEBPASS=$WEBPASS"
+            echo "RDPPASS=$RDPPASS"
+          } >> "$GITHUB_ENV"
+
+          # 3389 is published even when RDP is skipped: a container's port map is
+          # fixed at creation time and cannot be added to later. An unused
+          # published port costs nothing.
+          docker run -d --name kali \
+            -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
+            -e CUSTOM_USER=kali -e PASSWORD="$WEBPASS" \
+            -e TITLE="Kali Cloud Lab" \
+            --shm-size=1gb --security-opt seccomp=unconfined \
+            -p 3000:3000 -p 3389:3389 \
+            lscr.io/linuxserver/kali-linux:latest
+
+      - name: Wait for the desktop to come up
+        run: |
+          set -uo pipefail
+          echo "First boot pulls a multi-GB image and starts a full desktop — this can take several minutes."
+          for i in $(seq 1 150); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null || true)
+            if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+              echo "Web desktop is up (HTTP $code)"
+              docker exec kali sh -c "grep PRETTY_NAME /etc/os-release" 2>/dev/null || true
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Desktop did not respond in time. Recent container logs:"
+          docker logs --tail 150 kali || true
+          exit 1
+
+      - name: Set up xrdp for native RDP
+        if: ${{ inputs.rdp }}
+        run: |
+          set -uo pipefail
+
+          # ---------------------------------------------------------------------
+          # xrdp is added at runtime rather than baked into a forked image: the
+          # LinuxServer image is rebuilt constantly and a fork would rot.
+          #
+          # The browser desktop keeps running untouched the whole time. If any
+          # step here fails the run does NOT fail — it warns, and the browser
+          # route still works.
+          # ---------------------------------------------------------------------
+
+          echo "::group::Installing xrdp + XFCE inside the container"
+          # The image serves a KDE Plasma *Wayland* desktop to the browser. xrdp is
+          # an X11 RDP server and cannot attach to a Wayland session, so the RDP
+          # login gets its own X session.
+          #
+          # That session is XFCE by choice, not by limitation: it is far cheaper to
+          # redraw than Plasma (which is what you want at the end of a tunnel), and
+          # it keeps its settings in a different config namespace, so the two
+          # desktops cannot fight over ~/.config. Same user, same files, same tools.
+          #
+          # Recommends are deliberately LEFT ON here. Installing the parts list with
+          # --no-install-recommends skips the icon themes, and you get a desktop of
+          # captionless text where the icons should be.
+          if docker exec kali bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y --no-install-recommends xrdp xorgxrdp dbus-x11 xvfb
+            apt-get install -y xfce4 xfce4-terminal adwaita-icon-theme
+          ' > /tmp/xrdp-install.log 2>&1; then
+            echo "packages installed."
+          else
+            echo "::endgroup::"
+            echo "::warning title=RDP setup failed::Could not install xrdp. The browser desktop still works."
+            tail -40 /tmp/xrdp-install.log || true
+            exit 0
+          fi
+          echo "::endgroup::"
+
+          # --- Login credentials -----------------------------------------------
+          # xrdp authenticates through PAM against /etc/shadow. The image's unix
+          # user is 'abc' (uid 1000) and ships with NO password, because the browser
+          # route uses its own HTTP basic auth instead. So give it one.
+          #
+          # Note this means the RDP username is 'abc', not the 'kali' you type at
+          # the browser prompt — those are two unrelated auth systems.
+          docker exec kali bash -c "echo 'abc:${RDPPASS}' | chpasswd"
+
+          # --- Debian's X wrapper blocks non-console X servers ------------------
+          # Default is allowed_users=console. An RDP login is not a console login,
+          # so Xorg would exit before xorgxrdp ever loaded.
+          printf 'allowed_users=anybody\nneeds_root_rights=yes\n' > /tmp/Xwrapper.config
+          docker cp /tmp/Xwrapper.config kali:/etc/X11/Xwrapper.config
+
+          # --- The session xrdp-sesman starts on each login ---------------------
+          # Written here and copied in: nested heredocs through 'docker exec bash -c'
+          # are a quoting minefield.
+          cat > /tmp/startwm.sh <<'SH'
+          #!/bin/sh
+          # Drop anything inherited from the container's own Wayland session, or
+          # XFCE will try to talk to that bus and display instead of its own.
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          unset WAYLAND_DISPLAY
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_TYPE=x11
+          exec dbus-launch --exit-with-session startxfce4
+          SH
+          docker cp /tmp/startwm.sh kali:/etc/xrdp/startwm.sh
+          docker exec kali chmod +x /etc/xrdp/startwm.sh
+
+          # --- Make the desktop cheap to redraw, before the first login ---------
+          # Compositing draws every window twice (offscreen, then onscreen) and
+          # re-encodes the result; over a tunnel that is pure cost. box_move /
+          # box_resize are the outline-drag equivalent of Windows' DragFullWindows=0:
+          # one cheap redraw instead of a full repaint per pixel moved.
+          cat > /tmp/xfwm4.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="use_compositing" type="bool" value="false"/>
+              <property name="box_move" type="bool" value="true"/>
+              <property name="box_resize" type="bool" value="true"/>
+            </property>
+          </channel>
+          XML
+
+          # --- Seed the panel layout, or there IS no taskbar --------------------
+          # With no xfce4-panel.xml, the panel opens a modal "Welcome to the first
+          # start of the panel" dialog and draws nothing until it is answered. On a
+          # fresh headless session nobody can answer it, so you get a bare desktop —
+          # which is exactly the black-screen failure this repo hit three times
+          # before (53efb5c, ab5a93c, 4f5b146). Seeding a layout skips the prompt.
+          cat > /tmp/xfce4-panel.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-panel" version="1.0">
+            <property name="panels" type="array">
+              <value type="int" value="1"/>
+              <property name="panel-1" type="empty">
+                <property name="position" type="string" value="p=6;x=0;y=0"/>
+                <property name="length" type="uint" value="100"/>
+                <property name="position-locked" type="bool" value="true"/>
+                <property name="size" type="uint" value="30"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="1"/>
+                  <value type="int" value="2"/>
+                  <value type="int" value="3"/>
+                  <value type="int" value="4"/>
+                  <value type="int" value="5"/>
+                </property>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="applicationsmenu"/>
+              <property name="plugin-2" type="string" value="tasklist"/>
+              <property name="plugin-3" type="string" value="separator">
+                <property name="expand" type="bool" value="true"/>
+                <property name="style" type="uint" value="0"/>
+              </property>
+              <property name="plugin-4" type="string" value="systray"/>
+              <property name="plugin-5" type="string" value="clock"/>
+            </property>
+          </channel>
+          XML
+
+          # A plain background is one flat region to encode; the default gradient is
+          # a full screen of detail behind every window you move.
+          cat > /tmp/xfce4-desktop.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-desktop" version="1.0">
+            <property name="backdrop" type="empty">
+              <property name="screen0" type="empty">
+                <property name="monitor0" type="empty">
+                  <property name="workspace0" type="empty">
+                    <property name="color-style" type="int" value="0"/>
+                    <property name="image-style" type="int" value="0"/>
+                    <property name="rgba1" type="array">
+                      <value type="double" value="0.1"/>
+                      <value type="double" value="0.1"/>
+                      <value type="double" value="0.12"/>
+                      <value type="double" value="1.0"/>
+                    </property>
+                  </property>
+                </property>
+              </property>
+            </property>
+          </channel>
+          XML
+
+          XFCONF=/config/.config/xfce4/xfconf/xfce-perchannel-xml
+          docker exec kali mkdir -p "$XFCONF"
+          docker cp /tmp/xfwm4.xml         "kali:${XFCONF}/xfwm4.xml"
+          docker cp /tmp/xfce4-panel.xml   "kali:${XFCONF}/xfce4-panel.xml"
+          docker cp /tmp/xfce4-desktop.xml "kali:${XFCONF}/xfce4-desktop.xml"
+          docker exec kali chown -R 1000:1000 /config/.config/xfce4 || true
+
+          # Bind all interfaces so Docker's port map can reach it. xrdp already
+          # defaults to this, so it is normally a no-op — cheap insurance in case
+          # the packaged default ever changes to loopback-only.
+          docker exec kali sed -i 's/^address=127\.0\.0\.1/address=0.0.0.0/' /etc/xrdp/xrdp.ini || true
+
+          # --- Start the daemons ------------------------------------------------
+          # There is no systemd in the container, so start them directly. The '-d'
+          # on docker exec is what makes them outlive this step: they belong to the
+          # CONTAINER's process tree, which Actions does not tear down at a step
+          # boundary the way it tears down the runner's.
+          docker exec kali mkdir -p /var/run/xrdp
+          docker exec -d kali /usr/sbin/xrdp-sesman
+          sleep 2
+          docker exec -d kali /usr/sbin/xrdp
+          sleep 3
+
+          # --- Verify it genuinely speaks RDP -----------------------------------
+          # A TCP connect only proves Docker's userland proxy accepted the socket.
+          # Send a real X.224 Connection Request and require a Connection Confirm
+          # (0xD0) back — only an actual RDP stack can produce that.
+          #
+          # This confirms xrdp is listening and negotiating. It does not prove a
+          # session can spawn, which needs a real login; the diagnostics below
+          # cover the pieces that would make that fail.
+          cat > /tmp/rdp_probe.py <<'PY'
+          import socket, sys
+          req = bytes.fromhex("030000130ee000000000000100080003000000")
+          try:
+              s = socket.create_connection(("127.0.0.1", 3389), timeout=5)
+              s.sendall(req)
+              r = s.recv(19)
+              s.close()
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if len(r) >= 6 and r[0] == 3 and r[5] == 0xD0 else 1)
+          PY
+          # GITHUB_ENV only reaches LATER steps, so track it in a shell var too.
+          RDP_OK=0
+          for i in $(seq 1 30); do
+            if python3 /tmp/rdp_probe.py 2>/dev/null; then
+              echo "xrdp answered a real RDP handshake."
+              RDP_OK=1
+              echo "RDP_OK=1" >> "$GITHUB_ENV"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "::group::xrdp diagnostics"
+          docker exec kali /usr/sbin/xrdp --version 2>&1 | head -2 || true
+          docker exec kali pgrep -a 'xrdp|xrdp-sesman' || echo "  no xrdp process!"
+          docker exec kali find /usr/lib -name 'libxorgxrdp.so' 2>/dev/null | head -1 \
+            || echo "  xorgxrdp module not found — sessions would fail to start"
+          docker exec kali sh -c 'ss -ltnp 2>/dev/null | grep 3389 || netstat -ltnp 2>/dev/null | grep 3389' \
+            || echo "  nothing listening on 3389 inside the container"
+          echo "::endgroup::"
+
+          if [ "$RDP_OK" != "1" ]; then
+            echo "::warning title=xrdp never answered::The browser desktop still works. See the diagnostics group above."
+            docker exec kali tail -40 /var/log/xrdp.log 2>/dev/null || true
+            docker exec kali tail -40 /var/log/xrdp-sesman.log 2>/dev/null || true
+          fi
+
+      - name: Publish the public links and hold them open
+        run: |
+          set -uo pipefail
+          sudo wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -O /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+          # --- Browser route: Cloudflare quick tunnel ---------------------------
+          cloudflared tunnel --no-autoupdate --url http://localhost:3000 > /tmp/cf.log 2>&1 &
+          CF_PID=$!
+          URL=""
+          for i in $(seq 1 45); do
+            URL=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" /tmp/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+
+          # --- RDP route: bore --------------------------------------------------
+          # The runner sits behind Azure NAT with no inbound-reachable IP, so it
+          # cannot be dialed directly; something has to dial OUT and relay. bore
+          # needs no account, no card and nothing installed on your PC.
+          RDP_HOST=""
+          BORE_PID=""
+          if [ "${RDP_OK:-0}" = "1" ]; then
+            BORE_VER=0.6.0
+            curl -sSL "https://github.com/ekzhang/bore/releases/download/v${BORE_VER}/bore-v${BORE_VER}-x86_64-unknown-linux-musl.tar.gz" \
+              | sudo tar xz -C /usr/local/bin
+            sudo chmod +x /usr/local/bin/bore
+
+            # Writes the pid to a FILE, not a variable: this runs inside $( ), which
+            # is a subshell, so any variable it set would vanish when that exits.
+            start_bore () {
+              bore local 3389 --to bore.pub > /tmp/bore.log 2>&1 &
+              echo $! > /tmp/bore.pid
+              for i in $(seq 1 20); do
+                p=$(grep -oE 'remote_port[=:" ]*[0-9]+' /tmp/bore.log 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+                [ -z "$p" ] && p=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | grep -oE '[0-9]+$' | head -1 || true)
+                [ -n "$p" ] && { echo "$p"; return; }
+                sleep 1
+              done
+            }
+            BORE_PORT=$(start_bore)
+            BORE_PID=$(cat /tmp/bore.pid 2>/dev/null || true)
+            if [ -n "$BORE_PORT" ]; then
+              RDP_HOST="bore.pub:${BORE_PORT}"
+              echo "Native RDP endpoint: $RDP_HOST"
+            else
+              echo "::warning::bore did not report a port."; tail -20 /tmp/bore.log || true
+            fi
+          fi
+
+          {
+            echo "# 🐉 Kali Linux desktop is live"
+            echo ""
+            echo "Two ways in — **same machine, same files**, different path. Use either."
+            echo ""
+            if [ -n "$RDP_HOST" ]; then
+              echo "## ⚡ Remote Desktop — paste into an RDP client, NOT a browser"
+              echo ""
+              echo "\`\`\`"
+              echo "${RDP_HOST}"
+              echo "\`\`\`"
+              echo ""
+              echo "- username: \`abc\`"
+              echo "- password: \`${RDPPASS}\`"
+              echo ""
+              echo "> Windows key → type \`mstsc\` → Enter → paste the address into **Computer**."
+              echo "> On Linux/macOS use Remmina, FreeRDP (\`xfreerdp /v:${RDP_HOST}\`) or Windows App."
+              echo ""
+              echo "> It is a \`host:port\` pair — **not** an \`https://\` link. Pasting the"
+              echo "> \`trycloudflare.com\` link below into an RDP client gives"
+              echo "> \"The remote computer name is not valid\"."
+              echo ""
+              echo "You'll get a certificate warning on connect — xrdp generates its own"
+              echo "self-signed cert. Accept it and continue."
+              echo ""
+              echo "The username is \`abc\`, **not** \`kali\`: \`abc\` is the real Linux account,"
+              echo "while \`kali\` is only the browser page's login. The port also changes every"
+              echo "run, so copy it fresh each time."
+              echo ""
+              echo "---"
+              echo ""
+            fi
+            if [ -n "$URL" ]; then
+              echo "## 🌐 Browser desktop — paste into a BROWSER"
+              echo ""
+              echo "${URL}"
+              echo ""
+              echo "- username: \`kali\`"
+              echo "- password: \`${WEBPASS}\`"
+              echo ""
+              echo "Nothing to install. This is the full KDE Plasma desktop."
+              echo ""
+            else
+              echo "⚠️ Tunnel URL didn't appear. cloudflared log:"; echo '```'; cat /tmp/cf.log || true; echo '```'
+            fi
+            if [ -n "$RDP_HOST" ] && [ -n "$URL" ]; then
+              echo "---"
+              echo ""
+              echo "### Which one is actually faster for you?"
+              echo ""
+              echo "Genuinely worth testing rather than assuming. RDP is the more efficient"
+              echo "protocol — it caches bitmaps on your PC and sizes itself to your window."
+              echo "But the two take different routes: the browser link goes through"
+              echo "**Cloudflare's nearest edge to you**, while bore relays through a single"
+              echo "server in **New Jersey**. If you are far from the US, that detour can cost"
+              echo "more than the better protocol saves."
+              echo ""
+              echo "Open both, drag a window around in each, keep the winner."
+              echo ""
+            fi
+            if [ "${RDP_OK:-0}" != "1" ]; then
+              echo "> ℹ️ Native RDP is not running this time — either it was switched off when"
+              echo "> starting the workflow, or setup failed (check the previous step's log)."
+              echo "> The browser desktop above is unaffected."
+              echo ""
+            fi
+            echo "---"
+            echo "_Full Kali desktop (LinuxServer.io image). Ephemeral: nothing persists,"
+            echo "auto-stops at ~6h, cancel the run to stop sooner._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ -n "$RDP_HOST" ] && echo "::notice title=RDP (native client)::${RDP_HOST}  abc/${RDPPASS}"
+          echo "::notice title=Browser desktop::${URL}  kali/${WEBPASS}"
+          echo "=================================================="
+          echo " RDP     : ${RDP_HOST:-<not running>}   (abc / ${RDPPASS})"
+          echo " BROWSER : ${URL}   (kali / ${WEBPASS})"
+          echo "=================================================="
+
+          # Hold the job open so the desktop stays reachable (under the 6h cap).
+          END=$((SECONDS + 20400))
+          BORE_REVIVES=0
+          while [ $SECONDS -lt $END ]; do
+            if ! kill -0 "$CF_PID" 2>/dev/null; then echo "cloudflared exited:"; cat /tmp/cf.log; exit 1; fi
+            # bore.pub is a free community relay; if it drops the tunnel, reconnect.
+            # The port is NOT preserved across a reconnect, so shout about the new one.
+            if [ -n "${BORE_PID:-}" ] && ! kill -0 "$BORE_PID" 2>/dev/null; then
+              if [ "$BORE_REVIVES" -lt 10 ]; then
+                BORE_REVIVES=$((BORE_REVIVES + 1))
+                NEWPORT=$(start_bore)
+                BORE_PID=$(cat /tmp/bore.pid 2>/dev/null || true)
+                if [ -n "$NEWPORT" ]; then
+                  RDP_HOST="bore.pub:${NEWPORT}"
+                  echo "::warning title=bore reconnected — NEW RDP address::${RDP_HOST} (revive ${BORE_REVIVES})"
+                  { echo ""; echo "> ⚠️ bore reconnected. New RDP address: \`${RDP_HOST}\`"; } >> "$GITHUB_STEP_SUMMARY"
+                else
+                  echo "::warning::bore died and would not come back; use the browser route."
+                  BORE_PID=""
+                fi
+              else
+                echo "::warning::bore keeps dropping; giving up on it. The browser route still works."
+                BORE_PID=""
+              fi
+            fi
+            sleep 15
+          done
+          echo "Reached time limit; shutting down."
