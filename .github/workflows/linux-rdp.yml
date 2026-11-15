@@ -28,7 +28,7 @@ jobs:
       - name: Install XFCE and XRDP
         shell: bash
         env:
-          RDP_PASS: ${{ vars.RDP_PASSWORD }}
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
@@ -46,7 +46,7 @@ jobs:
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ vars.TALESCALE_AUTH_KEY }}
+          authkey: ${{ secrets.TALESCALE_AUTH_KEY }}
           version: latest
 
       - name: Bind RDP to Tailscale interface only
