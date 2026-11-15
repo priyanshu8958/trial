@@ -15,8 +15,8 @@ jobs:
       - name: Validate configuration
         shell: bash
         env:
-          TS_AUTH: ${{ vars.TALESCALE_AUTH_KEY }}
-          RDP_PASS: ${{ vars.RDP_PASSWORD }}
+          TS_AUTH: ${{ secrets.TALESCALE_AUTH_KEY }}
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
         run: |
           if [[ -z "$TS_AUTH" || -z "$RDP_PASS" ]]; then
             echo 'Missing TALESCALE_AUTH_KEY or RDP_PASSWORD repository variable.' >&2
