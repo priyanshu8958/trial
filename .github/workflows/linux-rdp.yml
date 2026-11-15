@@ -1,0 +1,76 @@
+name: Ubuntu Linux RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-rdp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate configuration
+        shell: bash
+        env:
+          TS_AUTH: ${{ vars.TALESCALE_AUTH_KEY }}
+          RDP_PASS: ${{ vars.RDP_PASSWORD }}
+        run: |
+          if [[ -z "$TS_AUTH" || -z "$RDP_PASS" ]]; then
+            echo 'Missing TALESCALE_AUTH_KEY or RDP_PASSWORD repository variable.' >&2
+            exit 1
+          fi
+          echo '::add-mask::'"$TS_AUTH"
+          echo '::add-mask::'"$RDP_PASS"
+
+      - name: Install XFCE and XRDP
+        shell: bash
+        env:
+          RDP_PASS: ${{ vars.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal thunar dbus-x11 xorgxrdp xrdp \
+            xserver-xorg-core xauth
+          sudo useradd --create-home --shell /bin/bash runner || true
+          printf 'runner:%s\n' "$RDP_PASS" | sudo chpasswd
+          printf 'startxfce4\n' | sudo tee /home/runner/.xsession > /dev/null
+          sudo chown runner:runner /home/runner/.xsession
+          sudo adduser xrdp ssl-cert
+          sudo systemctl enable xrdp
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ vars.TALESCALE_AUTH_KEY }}
+          version: latest
+
+      - name: Bind RDP to Tailscale interface only
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+          if [[ -z "$TS_IP" ]]; then
+            echo 'No Tailscale IPv4 address assigned.' >&2
+            exit 1
+          fi
+          sudo sed -i '/^\[Globals\]/a address='"$TS_IP" /etc/xrdp/xrdp.ini
+          sudo systemctl restart xrdp
+          sudo systemctl is-active --quiet xrdp
+          echo "### Linux RDP is ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "- RDP address: \`$TS_IP:3389\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '- Username: `runner`' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Password: value of `RDP_PASSWORD`' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Desktop: XFCE (choose Xorg in XRDP login screen)' >> "$GITHUB_STEP_SUMMARY"
+          echo "RDP address: $TS_IP:3389"
+          echo 'Username: runner'
+
+      - name: Keep Linux RDP running
+        shell: bash
+        run: |
+          echo 'Remote desktop active. Cancel this workflow to shut it down.'
+          sleep 21000
